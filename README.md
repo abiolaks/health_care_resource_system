@@ -1,8 +1,9 @@
 # HealthCare Resource Optimization System
 ```
-To run the code on Teerminal
+To run the code on Terminal
 python -m streamlit run health_v4.py
 streamlit run health_v4.py.
+```
 
 ## 1. Comprehensive Documentation
 This section details the design, architecture, and workflow of the  Healthcare Resource Optimization System.
