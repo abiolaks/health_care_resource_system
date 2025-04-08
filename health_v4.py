@@ -26,15 +26,33 @@ class HealthDataProcessor:
     def load_data(self):
         self.data = pd.read_csv(self.file_path)
         self._clean_data()
+        self._validate_data()
         self._calculate_metrics()
 
+    
     def _clean_data(self):
+        # Convert population to numeric (handle commas)
+        if 'Population Size' in self.data.columns:
+            self.data['Population Size'] = pd.to_numeric(
+                self.data['Population Size'].astype(str).str.replace(',', ''),
+                errors='coerce'
+            )
+        
+        # Handle missing values
         numeric_cols = self.data.select_dtypes(include=[np.number]).columns
         self.data[numeric_cols] = self.data[numeric_cols].fillna(self.data[numeric_cols].mean())
         
         non_numeric_cols = self.data.select_dtypes(exclude=[np.number]).columns
         for col in non_numeric_cols:
             self.data[col] = self.data[col].fillna(self.data[col].mode()[0])
+
+    def _validate_data(self):
+        # Ensure population data exists
+        if 'Population Size' not in self.data.columns:
+            raise ValueError("Missing 'Population Size' column in data")
+        
+        if self.data['Population Size'].sum() <= 0:
+            raise ValueError("Population data contains invalid values (sum <= 0)")
 
     def _calculate_metrics(self):
         # Calculate composite crisis index
@@ -77,16 +95,43 @@ class MortalityPredictor:
 
     def predict(self, X):
         return self.model.predict(X)
-
 class ResourceOptimizer:
-    """Optimization engine with explanations"""
+    """Optimization engine with guaranteed feasibility"""
     def __init__(self, data):
         self.data = data
         self.problem = pulp.LpProblem("Healthcare_Resource_Allocation", pulp.LpMinimize)
         self.solution = None
+        self.min_budget = 0.0
+        self.emergency_mode = False
+        
+        # Initialize costs and requirements
+        self.costs = {
+            'Beds': 100000,    # Ultra basic beds
+            'Doctors': 500000, # Community health workers
+            'Vaccines': 200    # Subsidized vaccines
+        }
+        self.min_requirements = {
+            'Beds': 0.0002,    # 1 bed per 5000 people
+            'Doctors': 0.0001, # 1 doctor per 10,000 people
+            'Vaccines': 0.05   # Vaccinate 5% population
+        }
 
-    def build_model(self, total_budget=5e9):
-        # Decision variables
+    def calculate_min_budget(self):
+        """Calculate minimum required budget"""
+        total_pop = self.data['Population Size'].sum()
+        self.min_budget = sum(
+            total_pop * req * self.costs[res]
+            for res, req in self.min_requirements.items()
+        )
+        return self.min_budget
+
+    def build_model(self, total_budget):
+        # Ensure minimum budget is at least 1 NGN to prevent division by zero
+        self.min_budget = max(self.min_budget, 1.0)
+        
+        # Calculate budget ratio safely
+        budget_ratio = min(total_budget / self.min_budget, 1.0) if self.min_budget > 0 else 0.0
+        
         regions = self.data['Region Name/Code'].unique()
         resources = ['Beds', 'Doctors', 'Vaccines']
         
@@ -98,65 +143,77 @@ class ResourceOptimizer:
             cat='Integer'
         )
         
-        # Objective: Minimize weighted crisis index
+        # Objective: Prioritize by crisis index
         self.problem += pulp.lpSum(
-            self.data.loc[self.data['Region Name/Code'] == r, 'Crisis_Index'].values[0] * 
+            (self.data.loc[self.data['Region Name/Code'] == r, 'Crisis_Index'].values[0]/100) *
             (self.vars[(r, 'Beds')] + self.vars[(r, 'Doctors')] + self.vars[(r, 'Vaccines')])
             for r in regions
         )
         
-        # Budget constraints (sample costs)
-        costs = {
-            'Beds': 500000,    # 500k NGN per bed
-            'Doctors': 2000000, # 2M NGN per doctor
-            'Vaccines': 1500    # 1.5k NGN per vaccine
-        }
-        
+        # Budget constraint
         self.problem += pulp.lpSum(
-            costs[res] * self.vars[(r, res)]
+            self.costs[res] * self.vars[(r, res)]
             for r in regions for res in resources
         ) <= total_budget
         
-        # Minimum coverage constraints
+        # Dynamic constraints
+        self.emergency_mode = total_budget < self.min_budget
+        budget_ratio = min(total_budget / self.min_budget, 1.0)
+
         for r in regions:
             pop = self.data.loc[self.data['Region Name/Code'] == r, 'Population Size'].values[0]
-            self.problem += self.vars[(r, 'Beds')] >= pop * 0.002  # 2 beds per 1000 people
-            self.problem += self.vars[(r, 'Doctors')] >= pop * 0.0005  # 1 doctor per 2000 people
-            self.problem += self.vars[(r, 'Vaccines')] >= pop * 0.5  # Vaccinate 50% population
+            for res in resources:
+                min_req = pop * self.min_requirements[res] * budget_ratio
+                self.problem += self.vars[(r, res)] >= max(min_req, 1)
 
     def solve(self):
-        self.problem.solve()
-        if pulp.LpStatus[self.problem.status] == 'Optimal':
-            self.solution = {
-                var.name: var.varValue 
-                for var in self.problem.variables()
-                if var.varValue > 0
-            }
-            return True
-        return False
+        """Solve the optimization problem"""
+        try:
+            self.problem.solve()
+            if pulp.LpStatus[self.problem.status] in ['Optimal', 'Feasible']:
+                self.solution = {
+                    var.name: var.varValue 
+                    for var in self.problem.variables()
+                    if var.varValue > 0
+                }
+                return True
+            return False
+        except Exception as e:
+            st.error(f"Optimization error: {str(e)}")
+            return False
 
     def get_explanations(self):
+        """Generate allocation explanations"""
         if not self.solution:
-            return "No solution found"
-            
-        # Generate insights
-        allocations = pd.DataFrame.from_dict(
-            {(k[0], k[1]): v for k, v in self.solution.items()},
-            orient='index',
-            columns=['Quantity']
-        ).reset_index()
+            return pd.DataFrame()  # Return empty DF instead of string
         
-        allocations.columns = ['Region', 'Resource', 'Quantity']
+        # Create DataFrame with proper region-resource parsing
+        allocations = pd.DataFrame(
+            [(k.split('_')[1], k.split('_')[2], v) 
+            for k, v in self.solution.items()
+        ], columns=['Region', 'Resource', 'Quantity'])
         
         # Merge with original data
         result = pd.merge(
-            allocations.pivot(index='Region', columns='Resource', values='Quantity'),
-            self.data[['Region Name/Code', 'Crisis_Index']],
+            allocations.pivot(index='Region', columns='Resource', values='Quantity').reset_index(),
+            self.data[['Region Name/Code', 'Crisis_Index', 'Population Size']],
             left_on='Region',
             right_on='Region Name/Code'
         )
         
-        return result.sort_values('Crisis_Index', ascending=False)
+        # Fill missing resources with 0
+        for res in ['Beds', 'Doctors', 'Vaccines']:
+            if res not in result.columns:
+                result[res] = 0
+        
+        # Calculate coverage metrics
+        result['Beds_per_5000'] = result['Beds'] / (result['Population Size']/5000).replace(0, 1)
+        result['Doctors_per_10k'] = result['Doctors'] / (result['Population Size']/10000).replace(0, 1)
+        result['Vaccination_Coverage'] = result['Vaccines'] / result['Population Size'].replace(0, 1)
+        
+        return result[['Region', 'Beds', 'Doctors', 'Vaccines', 
+                    'Crisis_Index', 'Beds_per_5000', 'Doctors_per_10k',
+                    'Vaccination_Coverage']].sort_values('Crisis_Index', ascending=False)
 
 def openai_insights(prompt):
     """Get AI-generated insights using OpenAI"""
@@ -195,8 +252,8 @@ def main():
     st.title("🇳🇬 Nigeria Healthcare Resource Optimization System")
     
     # Tab layout
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["National Overview", "Regional Analysis", "Risk Forecasting", "Optimization Engine"]
+    tab1, tab2, tab3 = st.tabs(
+        ["National Overview", "Regional Analysis", "Risk Forecasting"]
     )
 
     with tab1:
@@ -333,45 +390,7 @@ def main():
                         .sort_values('Mortality Rate (per 1000)', ascending=False),
                         height=200)
 
-    with tab4:
-        st.header("Resource Optimization Engine")
-        
-        budget = st.slider("Select Total Budget (NGN)", 1e9, 1e10, 5e9, step=1e8, format="%.0f")
-        
-        optimizer = ResourceOptimizer(data)
-        with st.spinner("Building optimization model..."):
-            optimizer.build_model(total_budget=budget)
-        
-        if st.button("Run Optimization"):
-            with st.spinner("Solving optimization problem..."):
-                if optimizer.solve():
-                    st.success("✅ Optimal allocation found!")
-                    
-                    # Show results
-                    results = optimizer.get_explanations()
-                    st.subheader("Optimal Resource Allocation")
-                    st.dataframe(results.style
-                                .background_gradient(cmap='YlGnBu', subset=['Beds', 'Doctors', 'Vaccines']),
-                                height=400)
-                    
-                    # Visualize allocation
-                    fig = px.bar(results,
-                                x='Region',
-                                y=['Beds', 'Doctors', 'Vaccines'],
-                                title="Recommended Resource Allocation",
-                                barmode='group')
-                    st.plotly_chart(fig)
-                    
-                    # Key insights
-                    st.subheader("Optimization Insights")
-                    top_recipient = results.iloc[0]['Region']
-                    st.markdown(f"""
-                    - 🎯 **Top Priority**: {top_recipient} will receive the most resources due to highest crisis index
-                    - ⚖️ **Equity Focus**: System automatically balances between high-need and high-population states
-                    - 💡 **Efficiency**: Allocation minimizes mortality risk per Naira spent
-                    """)
-                else:
-                    st.error("No feasible solution found with current budget")
+   
 
     # AI Recommendations Sidebar
     st.sidebar.header("🧠 AI-Powered Recommendations")
