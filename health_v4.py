@@ -249,7 +249,7 @@ def main():
     processor.load_data()
     data = processor.get_processed_data()
 
-    st.title("🇳🇬 Nigeria Healthcare Resource Optimization System")
+    st.title("Healthcare Resource Optimization System")
     
     # Tab layout
     tab1, tab2, tab3 = st.tabs(
